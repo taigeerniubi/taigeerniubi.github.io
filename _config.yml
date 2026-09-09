@@ -1,0 +1,30 @@
+# GitHub Pages 原生支持 Jekyll + minima 主题 + jekyll-feed，不需要任何 Actions，push 即发布。
+# 站点地址：https://taigeerniubi.github.io   RSS：https://taigeerniubi.github.io/feed.xml
+title: Leo Hao's Blog
+description: 记录 LLM 应用、Agent、MCP 与工程实践
+url: "https://taigeerniubi.github.io"
+baseurl: ""
+lang: zh-CN
+timezone: Asia/Shanghai
+
+author:
+  name: Leo Hao
+  email: TODO_EMAIL
+
+github_username: taigeerniubi
+# linkedin_username: TODO_LINKEDIN_ID   # 填上后页脚自动出现 LinkedIn 图标
+
+theme: minima
+minima:
+  skin: dark        # 可选 classic / dark / solarized 等
+  date_format: "%Y-%m-%d"
+
+plugins:
+  - jekyll-feed
+  - jekyll-seo-tag
+
+header_pages:
+  - about.md
+
+show_excerpts: true
+permalink: /:year/:month/:day/:title/

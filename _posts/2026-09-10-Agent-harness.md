@@ -22,13 +22,13 @@ excerpt: "模型可以说测试通过了，但谁真正运行测试、记录退�
 
 *图：模型负责判断下一步，Harness 负责让这一步安全地落到真实环境里。*
 
-## 模型只负责“想”，谁负责“做”
+## Harness 是模型与环境之间的控制面
 
 还是看修测试这件事。
 
 模型可能依次提出：读取报错、打开相关函数、修改一行代码、运行测试。真正执行这些动作的，是模型外围的程序。它要检查路径是否允许访问，调用文件或终端工具，把结果放回对话，再决定是否继续。
 
-我更愿意把 Harness 理解成 Agent 的运行时。它至少要处理五件事：
+更准确地说，Harness 是模型与真实环境之间的控制面。它处理五件事：
 
 - 给模型准备这一轮需要的上下文；
 - 把模型输出解析成工具调用；
@@ -37,6 +37,8 @@ excerpt: "模型可以说测试通过了，但谁真正运行测试、记录退�
 - 判断什么时候真的可以结束。
 
 这也解释了为什么“模型更聪明”不能替代 Harness。模型可以更准确地选择动作，却无法凭一句自然语言让文件发生变化。真正产生副作用的永远是执行层。
+
+同样，Harness 也不等于某个 Agent 框架。框架可以提供现成的循环、状态和工具抽象；Harness 是这些抽象最终承担的系统职责。直接调用模型 API，照样可以写出完整 Harness；用了框架，也可能仍然缺少权限、恢复和验证。
 
 ## 最小循环其实很短
 
@@ -59,13 +61,17 @@ while budget.available():
             save_tool_result(call.id, result)
         continue
 
-    if completion_checks_pass(response):
+    if response.finished and completion_checks_pass(response):
         return response
+
+    handle_non_terminal_stop(response)
 ```
 
 难点不在 `while`，而在每个看起来普通的函数。
 
 `build_context` 需要决定哪些历史消息还值得保留；`check_permission` 要区分读取代码和修改生产数据；`execute` 要处理超时、截断和部分成功；`completion_checks_pass` 则要找到模型声明之外的证据。
+
+还有一个容易被伪代码藏起来的问题：模型停止生成，不一定代表任务结束。接口可能因为输出达到 token 上限、服务端暂停、内容被拒绝或请求异常而停止。Harness 要读取 provider 返回的停止原因，把“正常结束”“等待继续”和“执行中断”映射成不同状态，而不能把没有 tool call 一律当作完成。Claude API 对 `end_turn`、`max_tokens`、`pause_turn` 等状态就有明确区分。[1]
 
 以测试为例，下面三句话完全不同：
 
@@ -85,7 +91,7 @@ while budget.available():
 {"tool": "run_tests", "arguments": {"target": "tests/test_discount.py"}}
 ```
 
-JSON Schema 可以约束 `target` 是字符串，却不能保证这个文件存在，更不能保证它覆盖了本次修改。调用 ID 可以把请求与结果配对，也不能证明结果是真实的。
+JSON Schema 可以约束 `target` 是字符串，却不能保证这个文件存在，更不能保证它覆盖了本次修改。严格工具调用也只保证受支持的结构约束，不负责业务正确性。调用 ID 可以把请求与结果配对，也不能证明结果是真实的。[2]
 
 因此 Harness 需要分别处理三层检查：
 
@@ -94,6 +100,10 @@ JSON Schema 可以约束 `target` 是字符串，却不能保证这个文件存�
 3. **结果**：环境状态是否满足任务验收条件。
 
 这三层最好落在确定性代码里。把“修改数据库前先确认”“完成后必须跑测试”只写在 prompt 中，意味着每一轮都在赌模型有没有记住。
+
+权限和验证也不要混为一谈。权限回答“能不能做”，沙箱约束“可以影响哪些资源”，验证回答“做完以后是否达到目标”。一次操作完全可能已获授权，但执行结果依然错误；也可能测试通过，却修改了不该碰的目录。
+
+Hooks 适合承接必须执行的前后置逻辑，例如工具调用前做路径检查，写入后记录审计事件，任务结束前触发测试。它们比提示词中的软约束更稳定，但也需要超时、错误隔离和可观测性。[3]
 
 工具返回值也应该尽量结构化。与其只返回一段 `success`，不如明确提供：
 
@@ -123,7 +133,7 @@ JSON Schema 可以约束 `target` 是字符串，却不能保证这个文件存�
 
 **Memory** 保存以后还值得使用的信息，例如项目测试命令、已经确认的约束和上次失败的原因。存下来并不等于每轮都加载，Harness 仍要判断什么时候取用。
 
-**MCP** 是接入外部能力与上下文的一套协议，可以暴露 Tools，也可以暴露 Resources 和 Prompts。[1] 它解决连接方式，不负责整个 Agent 循环。
+**MCP** 是接入外部能力与上下文的一套协议，可以暴露 Tools，也可以暴露 Resources 和 Prompts。[4] 它解决连接方式，不负责整个 Agent 循环。
 
 真正把这些东西串起来的，还是 Harness。
 
@@ -142,7 +152,9 @@ JSON Schema 可以约束 `target` 是字符串，却不能保证这个文件存�
 当前请求
 ```
 
-Prompt caching 能减少相同前缀的重复处理成本，但不会替你管理状态，也不会扩大模型的有效注意力。[2] Context 还是需要主动裁剪。
+Prompt caching 能减少相同前缀的重复处理成本，但不会替你管理状态，也不会扩大模型的有效注意力。[5] Context 还是需要主动裁剪。
+
+这里还涉及持久状态和瞬时上下文的区别。完整 message、检查点和原始工具输出可以长期保存，模型每轮只读取其中一部分。把“保存了什么”和“这一轮注入什么”拆开，才能同时保留可追溯性和较小的工作上下文。
 
 ## 中断恢复，最怕重复副作用
 
@@ -152,27 +164,30 @@ Prompt caching 能减少相同前缀的重复处理成本，但不会替你管�
 
 所以高风险工具需要幂等设计。例如使用稳定的任务 ID 去重，或者把“追加一条配置”改成“确保配置项等于某值”。只告诉模型“不要重复操作”不够可靠。
 
-## 第一版不必做得很大
+检查点也不只是保存聊天记录。一份能恢复工作的状态，至少要包含当前目标、已完成动作、待处理工具调用、产物引用和尚未完成的验证。否则恢复出来的只是“能继续聊天”，不是“能继续做事”。
 
-如果从零开始，我会先做这几个部分：
+## 子 Agent 解决的是边界，不是能力幻觉
 
-1. 三到五个边界清楚的工具；
-2. 一个带最大轮数、超时和取消能力的循环；
-3. 完整保存 message、tool call 与 tool result；
-4. 对写操作做明确的权限检查；
-5. 为任务完成准备一项环境侧验证。
+任务变大后，Harness 还可能负责调度子 Agent。它的直接收益通常是上下文隔离和并发：搜索代码的 Worker 不必把全部中间结果塞进主会话，主 Agent 只接收文件位置、结论和未解决问题。
 
-先把一条链路跑得可检查，再增加 Memory、Skills、子 Agent 或复杂恢复机制。
+但独立对话不等于独立环境。多个 Agent 可能仍然共享同一个工作目录、数据库和外部服务；真正的隔离要靠 worktree、容器、临时数据库或权限边界。汇总结果时也要保留失败与证据，不能只收一句“子任务完成”。
 
-判断 Harness 是否够用，也不必先看架构图。看它能不能回答几个朴素问题就行：改了什么，运行了什么，结果在哪里，失败后发生了什么，还有哪些事没做。
+## Harness 的质量最终落在证据上
+
+一套 Harness 是否可靠，不取决于目录里有多少组件，而取决于它是否保留了完整因果链：模型基于什么上下文作出判断，请求了哪个工具，执行层允许了什么，环境返回了什么，最终结论由什么证据支持。
+
+代码任务的证据可能是测试退出码和文件差异；客服任务可能是数据库里的退款记录和工单状态；浏览器任务则可能是目标页面的最终状态。模型输出属于这条链的一部分，却不是环境事实的替代品。
+
+当系统能稳定回答“改了什么、运行了什么、结果在哪里、失败后发生了什么、还有哪些事没做”，Agent 才真正从一次模型调用变成了可以运行、恢复和审计的软件系统。
 
 模型说“完成”很容易。Harness 的价值，是让这句话后面有证据。
 
 ## 参考资料
 
-1. [Model Context Protocol：Architecture](https://modelcontextprotocol.io/specification/2025-06-18/architecture)
-2. [Claude：Prompt caching](https://platform.claude.com/docs/en/build-with-claude/prompt-caching)
-3. [Claude：Handle tool calls](https://platform.claude.com/docs/en/agents-and-tools/tool-use/handle-tool-calls)
-4. [Claude Code：Hooks reference](https://code.claude.com/docs/en/hooks)
-5. [ReAct：Synergizing Reasoning and Acting in Language Models](https://arxiv.org/abs/2210.03629)
-6. [Anthropic：Building effective agents](https://www.anthropic.com/engineering/building-effective-agents)
+1. [Claude：Stop reasons and fallback](https://platform.claude.com/docs/en/build-with-claude/handling-stop-reasons)
+2. [Claude：Handle tool calls](https://platform.claude.com/docs/en/agents-and-tools/tool-use/handle-tool-calls)
+3. [Claude Code：Hooks reference](https://code.claude.com/docs/en/hooks)
+4. [Model Context Protocol：Architecture](https://modelcontextprotocol.io/specification/2025-06-18/architecture)
+5. [Claude：Prompt caching](https://platform.claude.com/docs/en/build-with-claude/prompt-caching)
+6. [ReAct：Synergizing Reasoning and Acting in Language Models](https://arxiv.org/abs/2210.03629)
+7. [Anthropic：Building effective agents](https://www.anthropic.com/engineering/building-effective-agents)
